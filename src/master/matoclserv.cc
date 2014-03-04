@@ -24,6 +24,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <netinet/in.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,6 +40,7 @@
 
 #include "common/cfg.h"
 #include "common/charts.h"
+#include "common/cltoma_communication.h"
 #include "common/datapack.h"
 #include "common/io_limits_config_loader.h"
 #include "common/main.h"
@@ -3329,7 +3331,27 @@ void matoclserv_fuse_getreserved(matoclserventry *eptr,const uint8_t *data,uint3
 	}
 }
 
-
+void matoclserv_iolimit(matoclserventry *eptr, const uint8_t *data, uint32_t length) {
+	std::string group;
+	bool wantMore;
+	uint64_t limit, usage;
+	cltoma::iolimit::deserialize(data, length, group, wantMore, limit, usage);
+	double limit_kB = limit / 1024.;
+	double usage_kB = usage / 1024.;
+	if (wantMore) {
+		if (limit_kB > 0) {
+			limit_kB = ceil(limit_kB * ioLimitsIncreaseRatio);
+		} else {
+			limit_kB = ioLimitsInitialKBps;
+		}
+	} else {
+		limit_kB = usage_kB;
+	}
+	limit = 1024 * ioLimitsDatabase.setAllocation(eptr, group, limit_kB);
+	std::vector<uint8_t> reply;
+	matocl::iolimit::serialize(reply, group, limit);
+	matoclserv_createpacket(eptr, reply);
+}
 
 void matocl_session_timedout(session *sesdata) {
 	filelist *fl,*afl;
@@ -3631,6 +3653,9 @@ void matoclserv_gotpacket(matoclserventry *eptr,uint32_t type,const uint8_t *dat
 				break;
 			case CLTOMA_CSSERV_REMOVESERV:
 				matoclserv_cserv_removeserv(eptr,data,length);
+				break;
+			case LIZ_CLTOMA_IOLIMIT:
+				matoclserv_iolimit(eptr,data,length);
 				break;
 			default:
 				syslog(LOG_NOTICE,"main master server module: got unknown message from mfsmount (type:%" PRIu32 ")",type);
