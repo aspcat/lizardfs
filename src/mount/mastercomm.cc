@@ -37,22 +37,23 @@
 #include <pwd.h>
 #include <grp.h>
 
+#include <vector>
+
+#include "common/datapack.h"
+#include "common/md5.h"
 #include "common/MFSCommunication.h"
-#include "stats.h"
+#include "common/packet.h"
 #include "common/sockets.h"
 #include "common/strerr.h"
-#include "common/md5.h"
-#include "common/datapack.h"
+#include "mount/stats.h"
 
 typedef struct _threc {
 	pthread_t thid;
 	pthread_mutex_t mutex;
 	pthread_cond_t cond;
-	uint8_t *obuff;
-	uint32_t obuffsize;
+	std::vector<uint8_t> outputBuffer;
+	std::vector<uint8_t> inputBuffer;
 	uint32_t odataleng;
-	uint8_t *ibuff;
-	uint32_t ibuffsize;
 	uint32_t idataleng;
 
 	uint8_t sent;		// packet was sent
@@ -79,6 +80,8 @@ typedef struct _acquired_file {
 #define RECEIVE_TIMEOUT 10
 
 static threc *threchead=NULL;
+
+static threc *ioLimitsThrec;
 
 static acquired_file *afhead=NULL;
 
@@ -173,6 +176,12 @@ static inline const char* mfs_strerror(uint8_t status) {
 	return errtab[status];
 }
 
+static inline void setDisconnect(bool value) {
+	pthread_mutex_lock(&fdlock);
+	disconnect = value;
+	pthread_mutex_unlock(&fdlock);
+}
+
 void fs_inc_acnt(uint32_t inode) {
 	acquired_file *afptr,**afpptr;
 	pthread_mutex_lock(&aflock);
@@ -226,14 +235,10 @@ threc* fs_get_my_threc() {
 			return rec;
 		}
 	}
-	rec = (threc*) malloc(sizeof(threc));
+	rec = new threc;
 	rec->thid = mythid;
 	pthread_mutex_init(&(rec->mutex),NULL);
 	pthread_cond_init(&(rec->cond),NULL);
-	rec->obuff = NULL;
-	rec->ibuff = NULL;
-	rec->obuffsize = 0;
-	rec->ibuffsize = 0;
 	rec->odataleng = 0;
 	rec->idataleng = 0;
 	rec->sent = 0;
@@ -266,81 +271,12 @@ threc* fs_get_threc_by_id(uint32_t packetid) {
 	return NULL;
 }
 
-void fs_output_buffer_init(threc *rec,uint32_t size) {
-	if (size>DEFAULT_OUTPUT_BUFFSIZE) {
-#ifdef MMAP_ALLOC
-		if (rec->obuff) {
-			munmap((void*)(rec->obuff),rec->obuffsize);
-		}
-		rec->obuff = (uint8_t*) (void*)mmap(NULL,size,PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE,-1,0);
-#else
-		if (rec->obuff) {
-			free(rec->obuff);
-		}
-		rec->obuff = malloc(size);
-#endif
-		rec->obuffsize = size;
-	} else if (rec->obuffsize!=DEFAULT_OUTPUT_BUFFSIZE) {
-#ifdef MMAP_ALLOC
-		if (rec->obuff) {
-			munmap((void*)(rec->obuff),rec->obuffsize);
-		}
-		rec->obuff = (uint8_t*) (void*)mmap(NULL,DEFAULT_OUTPUT_BUFFSIZE,PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE,-1,0);
-#else
-		if (rec->obuff) {
-			free(rec->obuff);
-		}
-		rec->obuff = malloc(DEFAULT_OUTPUT_BUFFSIZE);
-#endif
-		rec->obuffsize = DEFAULT_OUTPUT_BUFFSIZE;
-	}
-	if (rec->obuff==NULL) {
-		rec->obuffsize = 0;
-	}
-}
-
-void fs_input_buffer_init(threc *rec,uint32_t size) {
-	if (size>DEFAULT_INPUT_BUFFSIZE) {
-#ifdef MMAP_ALLOC
-		if (rec->ibuff) {
-			munmap((void*)(rec->ibuff),rec->ibuffsize);
-		}
-		rec->ibuff = (uint8_t*) (void*)mmap(NULL,size,PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE,-1,0);
-#else
-		if (rec->ibuff) {
-			free(rec->ibuff);
-		}
-		rec->ibuff = malloc(size);
-#endif
-		rec->ibuffsize = size;
-	} else if (rec->ibuffsize!=DEFAULT_INPUT_BUFFSIZE) {
-#ifdef MMAP_ALLOC
-		if (rec->ibuff) {
-			munmap((void*)(rec->ibuff),rec->ibuffsize);
-		}
-		rec->ibuff = (uint8_t*) (void*)mmap(NULL,DEFAULT_INPUT_BUFFSIZE,PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE,-1,0);
-#else
-		if (rec->ibuff) {
-			free(rec->ibuff);
-		}
-		rec->ibuff = malloc(DEFAULT_INPUT_BUFFSIZE);
-#endif
-		rec->ibuffsize = DEFAULT_INPUT_BUFFSIZE;
-	}
-	if (rec->ibuff==NULL) {
-		rec->ibuffsize = 0;
-	}
-}
-
 uint8_t* fs_createpacket(threc *rec,uint32_t cmd,uint32_t size) {
 	uint8_t *ptr;
 	uint32_t hdrsize = size+4;
 	pthread_mutex_lock(&(rec->mutex));	// make helgrind happy
-	fs_output_buffer_init(rec,size+12);
-	if (rec->obuff==NULL) {
-		return NULL;
-	}
-	ptr = rec->obuff;
+	rec->outputBuffer.resize(size+12);
+	ptr = rec->outputBuffer.data();
 	put32bit(&ptr,cmd);
 	put32bit(&ptr,hdrsize);
 	put32bit(&ptr,rec->packetid);
@@ -366,7 +302,7 @@ const uint8_t* fs_sendandreceive(threc *rec,uint32_t expected_cmd,uint32_t *answ
 		}
 		//syslog(LOG_NOTICE,"threc(%" PRIu32 ") - sending ...",rec->packetid);
 		pthread_mutex_lock(&(rec->mutex));	// make helgrind happy
-		if (tcptowrite(fd,rec->obuff,rec->odataleng,1000)!=(int32_t)(rec->odataleng)) {
+		if (tcptowrite(fd,rec->outputBuffer.data(),rec->odataleng,1000)!=(int32_t)(rec->odataleng)) {
 			syslog(LOG_WARNING,"tcp send error: %s",strerr(errno));
 			disconnect = 1;
 			pthread_mutex_unlock(&(rec->mutex));
@@ -409,9 +345,15 @@ const uint8_t* fs_sendandreceive(threc *rec,uint32_t expected_cmd,uint32_t *answ
 			sleep(1+((cnt<30)?(cnt/3):10));
 			continue;
 		}
+		const uint8_t *answer = rec->inputBuffer.data();
+		if (rec->rcvd_cmd <= PacketHeader::kMaxOldPacketType) {
+			// old code isn't prepared to get message ids; remove them
+			answer += 4;
+			*answer_leng -= 4;
+		}
 		pthread_mutex_unlock(&(rec->mutex));
 		//syslog(LOG_NOTICE,"threc(%" PRIu32 ") - received",rec->packetid);
-		return rec->ibuff;
+		return answer;
 	}
 	return NULL;
 }
@@ -432,7 +374,7 @@ const uint8_t* fs_sendandreceive_any(threc *rec,uint32_t *received_cmd,uint32_t 
 		}
 		//syslog(LOG_NOTICE,"threc(%" PRIu32 ") - sending ...",rec->packetid);
 		pthread_mutex_lock(&(rec->mutex));	// make helgrind happy
-		if (tcptowrite(fd,rec->obuff,rec->odataleng,1000)!=(int32_t)(rec->odataleng)) {
+		if (tcptowrite(fd,rec->outputBuffer.data(),rec->odataleng,1000)!=(int32_t)(rec->odataleng)) {
 			syslog(LOG_WARNING,"tcp send error: %s",strerr(errno));
 			disconnect = 1;
 			pthread_mutex_unlock(&(rec->mutex));
@@ -463,11 +405,26 @@ const uint8_t* fs_sendandreceive_any(threc *rec,uint32_t *received_cmd,uint32_t 
 			continue;
 		}
 		*received_cmd = rec->rcvd_cmd;
+		const uint8_t *answer = rec->inputBuffer.data();
+		if (rec->rcvd_cmd <= PacketHeader::kMaxOldPacketType) {
+			// old code isn't prepared to get message ids; remove them
+			answer += 4;
+			*answer_leng -= 4;
+		}
 		pthread_mutex_unlock(&(rec->mutex));
 		//syslog(LOG_NOTICE,"threc(%" PRIu32 ") - received",rec->packetid);
-		return rec->ibuff;
+		return answer;
 	}
 	return NULL;
+}
+
+const uint8_t* fs_sendandreceive_dupa(const std::vector<uint8_t>&& request, uint32_t& received_cmd,
+		uint32_t& answer_leng) {
+	if (ioLimitsThrec == NULL) {
+		ioLimitsThrec = fs_get_my_threc();
+	}
+	ioLimitsThrec->outputBuffer = std::move(request);
+	return fs_sendandreceive_any(ioLimitsThrec, &received_cmd, &answer_leng);
 }
 
 int fs_resolve(uint8_t oninit,const char *bindhostname,const char *masterhostname,const char *masterportname) {
@@ -1066,14 +1023,39 @@ void* fs_nop_thread(void *arg) {
 	}
 }
 
-void* fs_receive_thread(void *arg) {
-	const uint8_t *ptr;
-	uint8_t hdr[12];
-	threc *rec;
-	uint32_t cmd,size,packetid;
-	int r;
+template<class... Args>
+bool fsTryReadFromMaster(uint32_t& messageSize, Args&... destination) {
+	std::vector<uint8_t> buffer(serializedSize(destination...));
+	if (messageSize < buffer.size()) {
+		syslog(LOG_WARNING,"master: packet too small");
+		setDisconnect(true);
+		return false;
+	}
+	int bytesRead = tcptoread(fd, buffer.data(), buffer.size(), RECEIVE_TIMEOUT * 1000);
+	if (bytesRead == 0) {
+		syslog(LOG_WARNING, "master: connection lost (1)");
+		disconnect = true;
+		return false;
+	} else if (bytesRead != static_cast<int>(buffer.size())) {
+		syslog(LOG_WARNING, "master: tcp recv error: %s (1)", strerr(errno));
+		setDisconnect(true);
+		return false;
+	}
+	try {
+		deserialize(buffer, destination...);
+	} catch (IncorrectDeserializationException& e) {
+		syslog(LOG_WARNING,"master: tcp recv error: %s", e.what());
+		setDisconnect(true);
+		return false;
+	}
+	master_stats_add(MASTER_BYTESRCVD, buffer.size());
+	messageSize -= buffer.size();
+	return true;
+}
 
+void* fs_receive_thread(void *arg) {
 	(void)arg;
+
 	for (;;) {
 		pthread_mutex_lock(&fdlock);
 		if (fterm) {
@@ -1086,7 +1068,7 @@ void* fs_receive_thread(void *arg) {
 			disconnect=0;
 			// send to any threc status error and unlock them
 			pthread_mutex_lock(&reclock);
-			for (rec=threchead ; rec ; rec=rec->next) {
+			for (threc *rec = threchead; rec; rec = rec->next) {
 				pthread_mutex_lock(&(rec->mutex));
 				if (rec->sent) {
 					rec->status = 1;
@@ -1119,75 +1101,105 @@ void* fs_receive_thread(void *arg) {
 			continue;
 		}
 		pthread_mutex_unlock(&fdlock);
-		r = tcptoread(fd,hdr,12,RECEIVE_TIMEOUT*1000);	// read timeout - 4 seconds
-		// syslog(LOG_NOTICE,"master: header size: %d",r);
-		if (r==0) {
-			syslog(LOG_WARNING,"master: connection lost (1)");
-			disconnect=1;
-			continue;
-		}
-		if (r!=12) {
-			syslog(LOG_WARNING,"master: tcp recv error: %s (1)",strerr(errno));
-			disconnect=1;
-			continue;
-		}
-		master_stats_add(MASTER_BYTESRCVD,12);
-		master_stats_inc(MASTER_PACKETSRCVD);
 
-		ptr = hdr;
-		cmd = get32bit(&ptr);
-		size = get32bit(&ptr);
-		packetid = get32bit(&ptr);
-		if (size<4) {
-			syslog(LOG_WARNING,"master: packet too small");
-			disconnect=1;
+		PacketHeader packetHeader;
+		PacketVersion packetVersion;
+		uint32_t messageId;
+		uint32_t messageSize = serializedSize(packetHeader);
+		if (!fsTryReadFromMaster(messageSize, packetHeader)) {
 			continue;
 		}
-		size -= 4;
-		if (packetid==0) {
-			if (cmd==ANTOAN_NOP && size==0) {
-				// syslog(LOG_NOTICE,"master: got nop");
+		master_stats_inc(MASTER_PACKETSRCVD);
+		messageSize = packetHeader.length;
+
+		if (packetHeader.isLizPacketType()) {
+			if (messageSize < serializedSize(packetVersion)) {
+				syslog(LOG_WARNING,"master: packet too short: no version");
+				setDisconnect(true);
 				continue;
 			}
-			if (cmd==ANTOAN_UNKNOWN_COMMAND || cmd==ANTOAN_BAD_COMMAND_SIZE) { // just ignore these packets with packetid==0
+			if (!fsTryReadFromMaster(messageSize, packetVersion)) {
 				continue;
 			}
 		}
-		rec = fs_get_threc_by_id(packetid);
-		if (rec==NULL) {
-			syslog(LOG_WARNING,"master: got unexpected queryid");
-			disconnect=1;
-			continue;
+		switch (packetHeader.type) {
+		case LIZ_MATOCL_IOLIMITS_CONFIG:
+		case LIZ_MATOCL_IOLIMIT:
+			messageId = 0;
+			break;
+		default:
+			if (messageSize < serializedSize(messageId)) {
+				syslog(LOG_WARNING,"master: packet too short: no msgid");
+				setDisconnect(true);
+				continue;
+			}
+			if (!fsTryReadFromMaster(messageSize, messageId)) {
+				continue;
+			}
 		}
-		pthread_mutex_lock(&(rec->mutex));	// make helgrind happy
-		fs_input_buffer_init(rec,size);
-		if (rec->ibuff==NULL) {
-			pthread_mutex_unlock(&(rec->mutex));
-			disconnect=1;
-			continue;
+
+		threc *rec;
+		if (messageId == 0) {
+			switch (packetHeader.type) {
+			case ANTOAN_NOP:
+			case ANTOAN_UNKNOWN_COMMAND:
+			case ANTOAN_BAD_COMMAND_SIZE:
+				if (messageSize > 0) {
+					syslog(LOG_WARNING, "Got nonempty nop or bad command, disconnecting");
+					setDisconnect(true);
+				}
+				continue;
+			case LIZ_MATOCL_IOLIMITS_CONFIG:
+			case LIZ_MATOCL_IOLIMIT:
+				rec = ioLimitsThrec;
+				if (rec == NULL) {
+					syslog(LOG_WARNING,"master: got unexpected i/o limits message");
+					setDisconnect(true);
+					continue;
+				}
+				pthread_mutex_lock(&(rec->mutex));
+				rec->inputBuffer.clear();
+				serialize(rec->inputBuffer, packetVersion);
+			}
+		} else {
+			rec = fs_get_threc_by_id(messageId);
+			if (rec == NULL) {
+				syslog(LOG_WARNING,"master: got unexpected queryid");
+				setDisconnect(true);
+				continue;
+			}
+			pthread_mutex_lock(&(rec->mutex));
+			rec->inputBuffer.clear();
+			if (packetHeader.isLizPacketType()) {
+				serialize(rec->inputBuffer, packetVersion, messageId);
+			} else {
+				serialize(rec->inputBuffer, messageId);
+			}
 		}
-		// syslog(LOG_NOTICE,"master: expected data size: %" PRIu32,size);
-		if (size>0) {
-			r = tcptoread(fd,rec->ibuff,size,1000);
-			// syslog(LOG_NOTICE,"master: data size: %d",r);
-			if (r==0) {
+		const uint32_t responseSize = packetHeader.length;     // what we put in inputBuffer
+		const uint32_t dataOffset = rec->inputBuffer.size();
+		rec->inputBuffer.resize(responseSize);
+		uint8_t * const responsePointer = rec->inputBuffer.data() + dataOffset;
+		if (messageSize > 0) {
+			const int r = tcptoread(fd, responsePointer, messageSize, 1000);
+			if (r == 0) {
 				syslog(LOG_WARNING,"master: connection lost (2)");
 				pthread_mutex_unlock(&(rec->mutex));
-				disconnect=1;
+				setDisconnect(true);
 				continue;
 			}
-			if (r!=(int32_t)(size)) {
+			if (r != (int)messageSize) {
 				syslog(LOG_WARNING,"master: tcp recv error: %s (2)",strerr(errno));
 				pthread_mutex_unlock(&(rec->mutex));
-				disconnect=1;
+				setDisconnect(true);
 				continue;
 			}
-			master_stats_add(MASTER_BYTESRCVD,size);
+			master_stats_add(MASTER_BYTESRCVD, messageSize);
 		}
 		rec->sent = 0;
 		rec->status = 0;
-		rec->idataleng = size;
-		rec->rcvd_cmd = cmd;
+		rec->idataleng = responseSize;
+		rec->rcvd_cmd = packetHeader.type;
 		// syslog(LOG_NOTICE,"master: unlock: %" PRIu32,rec->packetid);
 		rec->rcvd = 1;
 		if (rec->waiting) {
@@ -1259,23 +1271,9 @@ void fs_term(void) {
 	pthread_mutex_destroy(&reclock);
 	for (tr = threchead ; tr ; tr = trn) {
 		trn = tr->next;
-		if (tr->obuff) {
-#ifdef MMAP_ALLOC
-			munmap((void*)(tr->obuff),tr->obuffsize);
-#else
-			free(tr->obuff);
-#endif
-		}
-		if (tr->ibuff) {
-#ifdef MMAP_ALLOC
-			munmap((void*)(tr->ibuff),tr->ibuffsize);
-#else
-			free(tr->ibuff);
-#endif
-		}
 		pthread_mutex_destroy(&(tr->mutex));
 		pthread_cond_destroy(&(tr->cond));
-		free(tr);
+		delete tr;
 	}
 	for (af = afhead ; af ; af = afn) {
 		afn = af->next;
