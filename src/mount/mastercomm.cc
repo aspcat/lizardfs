@@ -53,7 +53,6 @@ typedef struct _threc {
 	pthread_cond_t cond;
 	std::vector<uint8_t> outputBuffer;
 	std::vector<uint8_t> inputBuffer;
-	uint32_t odataleng;
 	uint32_t idataleng;
 
 	uint8_t sent;		// packet was sent
@@ -239,7 +238,6 @@ threc* fs_get_my_threc() {
 	rec->thid = mythid;
 	pthread_mutex_init(&(rec->mutex),NULL);
 	pthread_cond_init(&(rec->cond),NULL);
-	rec->odataleng = 0;
 	rec->idataleng = 0;
 	rec->sent = 0;
 	rec->status = 0;
@@ -280,7 +278,6 @@ uint8_t* fs_createpacket(threc *rec,uint32_t cmd,uint32_t size) {
 	put32bit(&ptr,cmd);
 	put32bit(&ptr,hdrsize);
 	put32bit(&ptr,rec->packetid);
-	rec->odataleng = size+12;
 	pthread_mutex_unlock(&(rec->mutex));	// make helgrind happy
 	return ptr;
 }
@@ -302,7 +299,7 @@ const uint8_t* fs_sendandreceive(threc *rec,uint32_t expected_cmd,uint32_t *answ
 		}
 		//syslog(LOG_NOTICE,"threc(%" PRIu32 ") - sending ...",rec->packetid);
 		pthread_mutex_lock(&(rec->mutex));	// make helgrind happy
-		if (tcptowrite(fd,rec->outputBuffer.data(),rec->odataleng,1000)!=(int32_t)(rec->odataleng)) {
+		if (tcptowrite(fd,rec->outputBuffer.data(),rec->outputBuffer.size(),1000)!=(int32_t)(rec->outputBuffer.size())) {
 			syslog(LOG_WARNING,"tcp send error: %s",strerr(errno));
 			disconnect = 1;
 			pthread_mutex_unlock(&(rec->mutex));
@@ -313,7 +310,7 @@ const uint8_t* fs_sendandreceive(threc *rec,uint32_t expected_cmd,uint32_t *answ
 		rec->rcvd = 0;
 		rec->sent = 1;
 		pthread_mutex_unlock(&(rec->mutex));	// make helgrind happy
-		master_stats_add(MASTER_BYTESSENT,rec->odataleng);
+		master_stats_add(MASTER_BYTESSENT,rec->outputBuffer.size());
 		master_stats_inc(MASTER_PACKETSSENT);
 		lastwrite = time(NULL);
 		pthread_mutex_unlock(&fdlock);
@@ -374,7 +371,7 @@ const uint8_t* fs_sendandreceive_any(threc *rec,uint32_t *received_cmd,uint32_t 
 		}
 		//syslog(LOG_NOTICE,"threc(%" PRIu32 ") - sending ...",rec->packetid);
 		pthread_mutex_lock(&(rec->mutex));	// make helgrind happy
-		if (tcptowrite(fd,rec->outputBuffer.data(),rec->odataleng,1000)!=(int32_t)(rec->odataleng)) {
+		if (tcptowrite(fd,rec->outputBuffer.data(),rec->outputBuffer.size(),1000)!=(int32_t)(rec->outputBuffer.size())) {
 			syslog(LOG_WARNING,"tcp send error: %s",strerr(errno));
 			disconnect = 1;
 			pthread_mutex_unlock(&(rec->mutex));
@@ -385,7 +382,7 @@ const uint8_t* fs_sendandreceive_any(threc *rec,uint32_t *received_cmd,uint32_t 
 		rec->rcvd = 0;
 		rec->sent = 1;
 		pthread_mutex_unlock(&(rec->mutex));	// make helgrind happy
-		master_stats_add(MASTER_BYTESSENT,rec->odataleng);
+		master_stats_add(MASTER_BYTESSENT,rec->outputBuffer.size());
 		master_stats_inc(MASTER_PACKETSSENT);
 		lastwrite = time(NULL);
 		pthread_mutex_unlock(&fdlock);

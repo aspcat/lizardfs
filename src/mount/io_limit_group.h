@@ -9,5 +9,7 @@
 
 LIZARDFS_CREATE_EXCEPTION_CLASS(GetIoLimitGroupIdException, Exception);
 
-std::string getIoLimitGroupId(std::istream& is, const std::string& subsystem);
-std::string getIoLimitGroupId(const pid_t pid, const std::string& subsystem);
+typedef std::string IoLimitGroupId;
+
+IoLimitGroupId getIoLimitGroupId(std::istream& is, const std::string& subsystem);
+IoLimitGroupId getIoLimitGroupId(const pid_t pid, const std::string& subsystem);

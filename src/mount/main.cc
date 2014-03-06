@@ -46,7 +46,7 @@
 #include "common/MFSCommunication.h"
 #include "common/strerr.h"
 #include "mount/csdb.h"
-#include "mount/global_io_limiter.h"
+#include "mount/g_io_limiters.h"
 #include "mount/mastercomm.h"
 #include "mount/masterproxy.h"
 #include "mount/mfs_fuse.h"
@@ -581,6 +581,9 @@ int mainloop(struct fuse_args *args,const char* mp,int mt,int fg) {
 			masterproxy_term();
 			fs_term();
 			symlink_cache_term();
+			return 1;
+		}
+		if (!gGlobalIoLimiter.init()) {
 			return 1;
 		}
 		csdb_init();

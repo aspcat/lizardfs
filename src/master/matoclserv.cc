@@ -189,9 +189,9 @@ static char *ListenPort;
 static uint32_t RejectOld;
 static uint32_t SessionSustainTime;
 
-static double ioLimitsIncreaseRatio;
-static double ioLimitsInitialKBps;
-static double ioLimitsRefreshTime;
+static double ioLimitsIncreaseRatio = 2;
+static double ioLimitsInitialKBps = 1;
+static double ioLimitsRefreshTime = 0.1;
 static std::string ioLimitsSubsystem;
 
 static IoLimitsDatabase ioLimitsDatabase;
@@ -3345,9 +3345,9 @@ void matoclserv_iolimit(matoclserventry *eptr, const uint8_t *data, uint32_t len
 			limit_kB = ioLimitsInitialKBps;
 		}
 	} else {
-		limit_kB = usage_kB;
+		limit_kB = usage_kB + 1;
 	}
-	limit = 1024 * ioLimitsDatabase.setAllocation(eptr, group, limit_kB);
+	limit = 1024 * limit_kB;//ioLimitsDatabase.setAllocation(eptr, group, limit_kB);
 	std::vector<uint8_t> reply;
 	matocl::iolimit::serialize(reply, group, limit);
 	matoclserv_createpacket(eptr, reply);

@@ -42,7 +42,7 @@
 #include "common/MFSCommunication.h"
 #include "common/strerr.h"
 #include "mount/dirattrcache.h"
-#include "mount/global_io_limiter.h"
+#include "mount/g_io_limiters.h"
 #include "mount/mastercomm.h"
 #include "mount/masterproxy.h"
 #include "mount/oplog.h"
@@ -1804,6 +1804,7 @@ void mfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, struct fus
 	}
 	try {
 		gIoLimiter.waitForRead(ctx.pid, size);
+		gGlobalIoLimiter.waitForRead("unclassified", size);
 	} catch (Exception& ex) {
 		syslog(LOG_WARNING, "I/O limiting error: %s", ex.what());
 		fuse_reply_err(req, EIO);
@@ -1892,6 +1893,7 @@ void mfs_write(fuse_req_t req, fuse_ino_t ino, const char *buf, size_t size, off
 	}
 	try {
 		gIoLimiter.waitForWrite(ctx.pid, size);
+		gGlobalIoLimiter.waitForRead("unclassified", size);
 	} catch (Exception& ex) {
 		syslog(LOG_WARNING, "I/O limiting error: %s", ex.what());
 		fuse_reply_err(req, EIO);

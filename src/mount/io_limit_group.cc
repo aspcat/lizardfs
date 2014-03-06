@@ -38,7 +38,7 @@ static bool searchSubsystems(std::istream& is, const std::string& subsystem) {
 	}
 }
 
-std::string getIoLimitGroupId(std::istream& input, const std::string& subsystem) {
+IoLimitGroupId getIoLimitGroupId(std::istream& input, const std::string& subsystem) {
 	try {
 		for (std::string line; std::getline(input, line); ) {
 			try {
@@ -63,7 +63,7 @@ std::string getIoLimitGroupId(std::istream& input, const std::string& subsystem)
 	throw GetIoLimitGroupIdException("Can't find subsystem '" + subsystem + "'");
 }
 
-std::string getIoLimitGroupId(const pid_t pid, const std::string& subsystem) {
+IoLimitGroupId getIoLimitGroupId(const pid_t pid, const std::string& subsystem) {
 	char filename[32];
 	sprintf(filename, "/proc/%u/cgroup", pid);
 	try {
