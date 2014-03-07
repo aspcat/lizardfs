@@ -43,6 +43,7 @@
 #include "common/io_limits_config_loader.h"
 #include "common/main.h"
 #include "common/massert.h"
+#include "common/matocl_communication.h"
 #include "common/MFSCommunication.h"
 #include "common/random.h"
 #include "common/slogger.h"
@@ -52,6 +53,7 @@
 #include "master/datacachemgr.h"
 #include "master/exports.h"
 #include "master/filesystem.h"
+#include "master/io_limits_database.h"
 #include "master/matocsserv.h"
 #include "master/matomlserv.h"
 
@@ -144,6 +146,8 @@ typedef struct matoclserventry {
 	 *       This is referred to as "unregistered clients".
 	 *    1: FUSE_REGISTER_BLOB_NOACL       or (FUSE_REGISTER_BLOB_ACL and (REGISTER_NEWSESSION or REGISTER_NEWMETASESSION or REGISTER_RECONNECT))
 	 *       This is referred to as "mounts and new tools" or "standard, registered clients".
+	 *    2: FUSE_REGISTER_BLOB_ACL and (REGISTER_NEWSESSION or REGISTER_RECONNECT) and (version >= 0x01061D)
+	 *       This is mount 1.6.29+ with enabled I/O limiting.
 	 *  100: FUSE_REGISTER_BLOB_TOOLS_NOACL or (FUSE_REGISTER_BLOB_ACL and REGISTER_TOOLS)
 	 *       This is referred to as "old mfstools".
 	 */
@@ -186,6 +190,9 @@ static uint32_t SessionSustainTime;
 static double ioLimitsIncreaseRatio;
 static double ioLimitsInitialKBps;
 static double ioLimitsRefreshTime;
+static std::string ioLimitsSubsystem;
+
+static IoLimitsDatabase ioLimitsDatabase;
 
 static uint32_t stats_prcvd = 0;
 static uint32_t stats_psent = 0;
@@ -663,6 +670,20 @@ uint8_t* matoclserv_createpacket(matoclserventry *eptr,uint32_t type,uint32_t si
 	*(eptr->outputtail) = outpacket;
 	eptr->outputtail = &(outpacket->next);
 	return ptr;
+}
+
+void matoclserv_createpacket(matoclserventry *eptr, const std::vector<uint8_t>& buffer) {
+	packetstruct *outpacket = (packetstruct*)malloc(sizeof(packetstruct));
+	passert(outpacket);
+	outpacket->packet = (uint8_t*) malloc(buffer.size());
+	passert(outpacket->packet);
+	outpacket->bytesleft = buffer.size();
+	// TODO unificate output packets and remove suboptimal memory copying
+	memcpy(outpacket->packet, buffer.data(), buffer.size());
+	outpacket->startptr = outpacket->packet;
+	outpacket->next = NULL;
+	*(eptr->outputtail) = outpacket;
+	eptr->outputtail = &(outpacket->next);
 }
 
 void matoclserv_chunk_status(uint64_t chunkid,uint8_t status) {
@@ -1188,6 +1209,13 @@ void matoclserv_notify_parent(uint32_t dirinode,uint32_t parent) {
 }
 */
 
+static void matoclserv_send_iolimits_cfg(matoclserventry *eptr) {
+	std::vector<uint8_t> buffer;
+	matocl::iolimits_config::serialize(buffer, ioLimitsSubsystem, ioLimitsDatabase.getGroups(),
+			ioLimitsRefreshTime * 1000 * 1000);
+	matoclserv_createpacket(eptr, buffer);
+}
+
 void matoclserv_fuse_register(matoclserventry *eptr,const uint8_t *data,uint32_t length) {
 	const uint8_t *rptr;
 	uint8_t *wptr;
@@ -1203,6 +1231,10 @@ void matoclserv_fuse_register(matoclserventry *eptr,const uint8_t *data,uint32_t
 		syslog(LOG_NOTICE,"CLTOMA_FUSE_REGISTER - wrong size (%" PRIu32 "/<64)",length);
 		eptr->mode = KILL;
 		return;
+	}
+	// clients probably shouldn't re-register themselves, but who knows...
+	if (eptr->registered == 2) {
+		ioLimitsDatabase.removeClient(eptr);
 	}
 	tools = (memcmp(data,FUSE_REGISTER_BLOB_TOOLS_NOACL,64)==0)?1:0;
 	if (eptr->registered==0 && (memcmp(data,FUSE_REGISTER_BLOB_NOACL,64)==0 || tools)) {
@@ -1428,7 +1460,13 @@ void matoclserv_fuse_register(matoclserventry *eptr,const uint8_t *data,uint32_t
 				put32bit(&wptr,mintrashtime);
 				put32bit(&wptr,maxtrashtime);
 			}
-			eptr->registered = 1;
+			if (eptr->version >= 0x01061D) {
+				eptr->registered = 2;
+				ioLimitsDatabase.addClient(eptr);
+				matoclserv_send_iolimits_cfg(eptr);
+			} else {
+				eptr->registered = 1;
+			}
 			return;
 		case REGISTER_NEWMETASESSION:
 			if (length<73) {
@@ -1526,7 +1564,17 @@ void matoclserv_fuse_register(matoclserventry *eptr,const uint8_t *data,uint32_t
 			if (status!=STATUS_OK) {
 				return;
 			}
-			eptr->registered = (rcode==3)?1:100;
+			if (rcode == REGISTER_RECONNECT) {
+				if (eptr->version >= 0x01061D) {
+					eptr->registered = 2;
+					ioLimitsDatabase.addClient(eptr);
+					matoclserv_send_iolimits_cfg(eptr);
+				} else {
+					eptr->registered = 1;
+				}
+			} else {
+				eptr->registered = 100;
+			}
 			return;
 		case REGISTER_CLOSESESSION:
 			if (length<69) {
@@ -3931,6 +3979,9 @@ void matoclserv_serve(struct pollfd *pdesc) {
 	kptr = &matoclservhead;
 	while ((eptr=*kptr)) {
 		if (eptr->mode == KILL) {
+			if (eptr->registered == 2) {
+				ioLimitsDatabase.removeClient(eptr);
+			}
 			matocl_beforedisconnect(eptr);
 			tcpclose(eptr->sock);
 			if (eptr->inputpacket.packet) {
@@ -4014,6 +4065,11 @@ int matoclserv_iolimits_reload() {
 	ioLimitsIncreaseRatio = cfg_get_minvalue("IOLIMITS_INCREASE_RATIO", 1.2, 1.0);
 	ioLimitsInitialKBps = cfg_get_minvalue("IOLIMITS_INITIAL_KBPS", 1.0, 1.0);
 	ioLimitsRefreshTime = cfg_get_minvalue("IOLIMITS_RENEGOTIATION_PERIOD", 0.1, 0.05);
+
+	ioLimitsSubsystem = configLoader.subsystem();
+	ioLimitsDatabase.setLimits(configLoader.limits());
+
+	// TODO: push new configuration to clients
 
 	return 0;
 }
